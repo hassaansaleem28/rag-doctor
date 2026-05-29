@@ -1,11 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import { getCoralTools, callCoralTool } from "@/lib/coral";
 
-const answerCache = new Map<
-  string,
-  { answer: string; toolCalls: ToolCall[] }
->();
+interface ToolCall {
+  name: string;
+  args: Record<string, unknown>;
+  result: string;
+}
+
+interface AgentResult {
+  answer: string;
+  toolCalls: ToolCall[];
+}
+
+const answerCache = new Map<string, AgentResult>();
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 const SYSTEM_PROMPT = `You are RAG Doctor — an AI observability agent.
@@ -52,104 +60,122 @@ RULES:
 - Always include the PostHog environment_id filter when querying posthog.events.
 - After getting data, write a concise plain-English answer.`;
 
-interface ToolCall {
-  name: string;
-  args: Record<string, unknown>;
-  result: string;
+const ALLOWED_TOOLS = [
+  "sql",
+  "list_catalog",
+  "search_catalog",
+  "describe_table",
+  "list_columns",
+];
+
+async function getFunctionDeclarations() {
+  const coralTools = await getCoralTools();
+  return coralTools
+    .filter((t) => ALLOWED_TOOLS.includes(t.name))
+    .map((t) => ({
+      name: t.name,
+      description: (t.description || "").slice(0, 500),
+      parametersJsonSchema: t.inputSchema as Record<string, unknown>,
+    }));
+}
+
+async function runAgentLoop(
+  question: string,
+  maxSteps: number,
+  onTool?: (tc: ToolCall) => void,
+  onStep?: (step: number) => void,
+): Promise<AgentResult> {
+  const functionDeclarations = await getFunctionDeclarations();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const contents: any[] = [{ role: "user", parts: [{ text: question }] }];
+  const toolCalls: ToolCall[] = [];
+  let finalAnswer = "";
+
+  for (let step = 0; step < maxSteps; step++) {
+    onStep?.(step + 1);
+
+    let response;
+    let attempts = 0;
+    while (true) {
+      try {
+        response = await ai.models.generateContent({
+          model: "gemini-2.5-flash",
+          contents,
+          config: {
+            systemInstruction: SYSTEM_PROMPT,
+            tools: [{ functionDeclarations }],
+          },
+        });
+        break;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } catch (e: any) {
+        attempts++;
+        if (e?.status === 429 && attempts < 4) {
+          await new Promise((r) => setTimeout(r, 12000));
+          continue;
+        }
+        throw e;
+      }
+    }
+
+    const candidate = response.candidates?.[0];
+    const parts = candidate?.content?.parts || [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fnCalls = parts.filter((p: any) => p.functionCall);
+
+    if (fnCalls.length === 0) {
+      finalAnswer = response.text || "";
+      break;
+    }
+
+    contents.push({ role: "model", parts });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const responseParts: any[] = [];
+    for (const part of fnCalls) {
+      const fc = part.functionCall;
+      const args = fc.args || {};
+      let resultText = "";
+      try {
+        const result = await callCoralTool(fc.name, args);
+        resultText = JSON.stringify(result.content);
+      } catch (err) {
+        resultText = `Error: ${err instanceof Error ? err.message : String(err)}`;
+      }
+      const toolCall: ToolCall = { name: fc.name, args, result: resultText };
+      toolCalls.push(toolCall);
+      onTool?.(toolCall);
+      responseParts.push({
+        functionResponse: { name: fc.name, response: { result: resultText } },
+      });
+    }
+    contents.push({ role: "user", parts: responseParts });
+  }
+
+  if (!finalAnswer) {
+    finalAnswer =
+      "I ran several queries but could not synthesize a final answer within the step limit. Check the tool calls below.";
+  }
+  return { answer: finalAnswer, toolCalls };
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const { question } = await req.json();
+    const { question, stream = false, maxSteps = 5 } = await req.json();
     if (!question) {
       return NextResponse.json({ error: "Missing question" }, { status: 400 });
     }
+    if (stream) {
+      return streamingResponse(question, maxSteps);
+    }
+
     const cached = answerCache.get(question);
     if (cached) {
       return NextResponse.json(cached);
     }
-    const coralTools = await getCoralTools();
-    const ALLOWED_TOOLS = [
-      "sql",
-      "list_catalog",
-      "search_catalog",
-      "describe_table",
-      "list_columns",
-    ];
-
-    const functionDeclarations = coralTools
-      .filter((t) => ALLOWED_TOOLS.includes(t.name))
-      .map((t) => ({
-        name: t.name,
-        description: (t.description || "").slice(0, 500),
-        parametersJsonSchema: t.inputSchema as Record<string, unknown>,
-      }));
-
-    const contents: any[] = [{ role: "user", parts: [{ text: question }] }];
-
-    const toolCalls: ToolCall[] = [];
-    let finalAnswer = "";
-
-    for (let step = 0; step < 5; step++) {
-      let response;
-      let attempts = 0;
-      while (true) {
-        try {
-          response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents,
-            config: {
-              systemInstruction: SYSTEM_PROMPT,
-              tools: [{ functionDeclarations }],
-            },
-          });
-          break;
-        } catch (e: any) {
-          attempts++;
-          if (e?.status === 429 && attempts < 4) {
-            await new Promise((r) => setTimeout(r, 12000));
-            continue;
-          }
-          throw e;
-        }
-      }
-
-      const candidate = response.candidates?.[0];
-      const parts = candidate?.content?.parts || [];
-      const fnCalls = parts.filter((p: any) => p.functionCall);
-
-      if (fnCalls.length === 0) {
-        finalAnswer = response.text || "";
-        break;
-      }
-
-      contents.push({ role: "model", parts });
-
-      const responseParts: any[] = [];
-      for (const part of fnCalls) {
-        const fc = part.functionCall;
-        const args = fc.args || {};
-        let resultText = "";
-        try {
-          const result = await callCoralTool(fc.name, args);
-          resultText = JSON.stringify(result.content);
-        } catch (err) {
-          resultText = `Error: ${err instanceof Error ? err.message : String(err)}`;
-        }
-        toolCalls.push({ name: fc.name, args, result: resultText });
-        responseParts.push({
-          functionResponse: { name: fc.name, response: { result: resultText } },
-        });
-      }
-      contents.push({ role: "user", parts: responseParts });
-    }
-
-    if (!finalAnswer) {
-      finalAnswer =
-        "I ran several queries but could not synthesize a final answer within the step limit. Check the tool calls below.";
-    }
-    answerCache.set(question, { answer: finalAnswer, toolCalls });
-    return NextResponse.json({ answer: finalAnswer, toolCalls });
+    const result = await runAgentLoop(question, maxSteps);
+    answerCache.set(question, result);
+    return NextResponse.json(result);
   } catch (err) {
     console.error(err);
     return NextResponse.json(
@@ -157,4 +183,49 @@ export async function POST(req: NextRequest) {
       { status: 500 },
     );
   }
+}
+
+function streamingResponse(question: string, maxSteps: number) {
+  const encoder = new TextEncoder();
+  const sseStream = new ReadableStream({
+    async start(controller) {
+      const send = (event: string, data: unknown) => {
+        controller.enqueue(
+          encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
+        );
+      };
+      try {
+        const cached = answerCache.get(question);
+        if (cached) {
+          for (const tc of cached.toolCalls) send("tool", tc);
+          send("done", { answer: cached.answer, cached: true });
+          controller.close();
+          return;
+        }
+
+        const result = await runAgentLoop(
+          question,
+          maxSteps,
+          (tc) => send("tool", tc),
+          (step) => send("step", { step }),
+        );
+        answerCache.set(question, result);
+        send("done", { answer: result.answer });
+      } catch (err) {
+        send("error", {
+          message: err instanceof Error ? err.message : "Unknown error",
+        });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(sseStream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    },
+  });
 }
