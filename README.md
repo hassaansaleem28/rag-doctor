@@ -2,7 +2,7 @@
 
 > An AI observability agent that diagnoses production RAG stacks in plain English. Built on **Coral**, the MCP server that gives you one SQL surface over Langfuse, Weaviate, PostHog, and Datadog.
 
-![dashboard](docs/screenshot.png)
+![dashboard](.docs/screenshot.png)
 
 ---
 
